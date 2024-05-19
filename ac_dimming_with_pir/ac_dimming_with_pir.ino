@@ -1,36 +1,64 @@
-#include <Ticker.h>  
-Ticker timer1;       
+#include <Ticker.h>
 
-#define PIN_TRIAC_PULSE 4 
+#include <cmath>  // for std::ceil
+Ticker timer1;
+
+#define PIN_TRIAC_PULSE 4
 #define PIN_PIR_IN 12
 #define PIN_ZERO_CROSS 5
-#define MAX_BRIGHTNESS_LEVEL 300
 #define LOOP_DELAY_NON_DIMMING 500
-#define LOOP_DELAY_DIMMING 10
+#define LOOP_DELAY_DIMMING 20
+#define DEBOUNCE_TIME 3000
 
 // 1000000us / 60hz / 2 = 8333us
 bool interruptEnabled = true;
-int last_chop_time = 0;
-const long delay_to_dark = 0.2 * 60 * 1000;  // 5 minutes in milliseconds
-const int dimming_time = 1000;
-const int minimum_brightness_level = 50;
-int max_brightness_level = MAX_BRIGHTNESS_LEVEL;
-const long changeInterval =
-    dimming_time / (max_brightness_level - minimum_brightness_level);
-unsigned long lastTriggerTime = 0;
-unsigned long triggerStartTime = 0;
-int brightness = 500;
-int brightness_level = 300;
-
+const int dimming_time = 3000;
+int int_current_brightness = 0;
+int current_level = 2;
+int current_brightness = 300;
+int target_brightness = 300;
 unsigned long lastChangeTime = 0;
 bool triggered = false;
 bool auto_mode = true;
-bool brighter_in_progress = false;
-bool darker_in_progress = false;
+float dimming_step = 0;
+bool dimming_in_progress = false;
 int triggerCount = 0;
+int start_time_in_current_level = 0;
+static unsigned long lastTriggerTime = 0;
+
+struct Level {
+  int brightness;
+  unsigned long timeToPreviousLevel;
+};
+
+Level levels[] = {
+    {0, -1}, {50, 10000}, {70, 10000}, {100, 10000}, {200, 20000}, {300, 20000},
+};
+
+void set_level(int level) {
+  struct Level level_value = levels[current_level];
+  target_brightness = level_value.brightness;
+  dimming_step = static_cast<float>(target_brightness - current_brightness) /
+                 (dimming_time / LOOP_DELAY_DIMMING);
+  if (dimming_step > 0 && dimming_step < 1) {
+    dimming_step = 1;
+  } else if (dimming_step < 0 && dimming_step > -1) {
+    dimming_step = -1;
+  }
+  dimming_in_progress = true;
+
+  Serial.print("current_brightness: ");
+  Serial.print(current_brightness);
+  Serial.print(" target_brightness: ");
+  Serial.print(target_brightness);
+  Serial.print(" dimming_step: ");
+  Serial.println(dimming_step);
+}
 
 void setup() {
-  brightness = dimming_map(brightness_level);
+  current_level = sizeof(levels) / sizeof(levels[0]) - 1;
+  current_brightness = levels[current_level].brightness;
+  int_current_brightness = dimming_map(current_brightness);
   Serial.begin(115200);
   Serial.setTimeout(500);
   pinMode(PIN_TRIAC_PULSE, OUTPUT);
@@ -40,81 +68,81 @@ void setup() {
 
 IRAM_ATTR void handleInturrupt() {
   if (interruptEnabled) {
-    int chop_time = (8.33 * brightness);
-    if (last_chop_time != chop_time) {
-      last_chop_time = chop_time;
-      // Serial.print("chop_time:");
-      // Serial.println(chop_time);
-    }
+    int chop_time = (8.33 * int_current_brightness);
 
     digitalWrite(PIN_TRIAC_PULSE, HIGH);
     delayMicroseconds(chop_time);
     digitalWrite(PIN_TRIAC_PULSE, LOW);
+  } else {
+    digitalWrite(PIN_TRIAC_PULSE, HIGH);
   }
 }
 
 int dimming_map(int val) {
-  int data1 = map(val, 0, 1000, 900, 90);
-  return data1;
+  interruptEnabled = val != 0;
+  return map(val, 0, 1000, 900, 90);
 }
-bool trigger1 = false;
+
 void loop() {
-  if(brighter_in_progress || darker_in_progress){
+  if (dimming_in_progress) {
     delay(LOOP_DELAY_DIMMING);
-  }
-  else{
+  } else {
     delay(LOOP_DELAY_NON_DIMMING);
-    }
+  }
 
   if (auto_mode) {
-    if (digitalRead(PIN_PIR_IN) == HIGH) {
-      lastTriggerTime = millis();
-      if (triggerStartTime == 0) {
-        triggerStartTime = millis();
-        trigger1 = true;
+    struct Level level = levels[current_level];
+    int current_time = millis();
+    int last_level = current_level;
+
+    if ((current_time - start_time_in_current_level) > level.timeToPreviousLevel &&
+        level.timeToPreviousLevel > 0) {
+      current_level--;
+      if (current_level <= 0) {
+        current_level = 0;
       }
-      if (trigger1) {
-        if (millis() - triggerStartTime >= 4000) {
-          digitalWrite(PIN_TRIAC_PULSE, LOW);
-          interruptEnabled = true;
-          brighter_in_progress = true;
-          darker_in_progress = false;
-          trigger1 = false;
-          triggerStartTime = 0;
-        }
-      }
+      start_time_in_current_level = millis();
     } else {
-      if (trigger1 && millis() - triggerStartTime >= 7000) {
-        trigger1 = false;
-        triggerStartTime = 0;
-      }
-    }
-
-    if (!brighter_in_progress) {
-      int remainingTime = millis() - lastTriggerTime;
-      if (remainingTime >= delay_to_dark) {
-        if (millis() - lastChangeTime >= changeInterval) {
-          if (brightness_level > minimum_brightness_level) {
-            darker_in_progress = true;
-            brightness_level--;                                                                                                                 
-            brightness = dimming_map(brightness_level);
+      // level up with any trigger
+      if (digitalRead(PIN_PIR_IN) == HIGH) {
+        unsigned long currentTime = start_time_in_current_level = millis();
+        if (currentTime - lastTriggerTime >= DEBOUNCE_TIME) {
+          current_level++;
+          int level_count = sizeof(levels) / sizeof(levels[0]);
+          if (current_level >= level_count) {
+            current_level = level_count - 1;
           }
-          lastChangeTime = millis();
+          lastTriggerTime = currentTime;
         }
       }
-      else if(!darker_in_progress){
-        Serial.println("Remaining time to decrease brightness: " + String(delay_to_dark - remainingTime) + " ms");
-      }
+    }
+    if (last_level != current_level) {
+      Serial.print("level change from last_level:");
+      Serial.print(last_level);
+      Serial.print(" to current_level:");
+      Serial.println(current_level);
+
+      set_level(current_level);
     }
 
-    if (brighter_in_progress && millis() - lastChangeTime >= changeInterval) {
-      if (brightness_level < max_brightness_level) {
-        brightness_level++;
-        brightness = dimming_map(brightness_level);
-      } else {
-        brighter_in_progress = false;
+    if (current_brightness != target_brightness) {
+      current_brightness += dimming_step;
+      if (current_brightness < 0) {
+        current_brightness = 0;
+      } else if (current_brightness > 1000) {
+        current_brightness = 1000;
       }
-      lastChangeTime = millis();
+
+      if (abs(target_brightness - current_brightness) < abs(dimming_step)) {
+        current_brightness = target_brightness;
+        dimming_in_progress = false;
+      }
+
+      int_current_brightness = dimming_map(current_brightness);
+      // Serial.print("current_brightness: ");
+      // Serial.println(current_brightness);
+    } else {
+      dimming_in_progress = false;
     }
   }
 
@@ -139,10 +167,10 @@ void loop() {
       int reading = command.toInt();
       auto_mode = false;
       if (reading >= 0) {
-        brightness = dimming_map(reading);
+        current_brightness = dimming_map(reading);
         interruptEnabled = true;
-        Serial.print("brightness: ");
-        Serial.print(brightness);
+        // Serial.print("current_brightness: ");
+        // Serial.print(current_brightness);
       }
     }
     Serial.println("");
